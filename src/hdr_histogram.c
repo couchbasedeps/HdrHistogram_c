@@ -4,6 +4,7 @@
  * as explained at http://creativecommons.org/publicdomain/zero/1.0/
  */
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <math.h>
@@ -13,9 +14,13 @@
 #include <stdint.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <hdr_thread.h>
 
 #include "hdr_histogram.h"
 #include "hdr_tests.h"
+
+static hdr_mutex hdrMutex = {0};
+static atomic_bool hdrMutexInit = false;
 
 /*  ######   #######  ##     ## ##    ## ########  ######  */
 /* ##    ## ##     ## ##     ## ###   ##    ##    ##    ## */
@@ -50,7 +55,7 @@ static int32_t normalize_index(const struct hdr_histogram* h, int32_t index)
 
 static int64_t counts_get_direct(const struct hdr_histogram* h, int32_t index)
 {
-    return h->counts[index];
+    return atomic_load_explicit((atomic_int_least64_t*)&h->counts[index], memory_order_relaxed);
 }
 
 static int64_t counts_get_normalised(const struct hdr_histogram* h, int32_t index)
@@ -62,14 +67,20 @@ static void counts_inc_normalised(
     struct hdr_histogram* h, int32_t index, int64_t value)
 {
     int32_t normalised_index = normalize_index(h, index);
-    h->counts[normalised_index] += value;
-    h->total_count += value;
+    atomic_fetch_add_explicit(&h->counts[normalised_index], value, memory_order_relaxed);
+    atomic_fetch_add_explicit(&h->total_count, value, memory_order_relaxed);
 }
 
 static void update_min_max(struct hdr_histogram* h, int64_t value)
 {
-    h->min_value = (value < h->min_value && value != 0) ? value : h->min_value;
-    h->max_value = (value > h->max_value) ? value : h->max_value;
+    int64_t min = atomic_load_explicit(&h->min_value, memory_order_acquire);
+    if (value < min && value != 0) {
+        atomic_store_explicit(&h->min_value, value, memory_order_release);
+    }
+    int64_t max = atomic_load_explicit(&h->max_value, memory_order_acquire);
+    if (value > max) {
+        atomic_store_explicit(&h->max_value, value, memory_order_release);
+    }
 }
 
 /* ##     ## ######## #### ##       #### ######## ##    ## */
@@ -213,24 +224,24 @@ void hdr_reset_internal_counters(struct hdr_histogram* h)
 
     if (max_index == -1)
     {
-        h->max_value = 0;
+        atomic_store(&h->max_value, 0);
     }
     else
     {
         int64_t max_value = hdr_value_at_index(h, max_index);
-        h->max_value = highest_equivalent_value(h, max_value);
+        atomic_store(&h->max_value, highest_equivalent_value(h, max_value));
     }
 
     if (min_non_zero_index == -1)
     {
-        h->min_value = INT64_MAX;
+        atomic_store(&h->min_value, INT64_MAX);
     }
     else
     {
-        h->min_value = hdr_value_at_index(h, min_non_zero_index);
+        atomic_store(&h->min_value, hdr_value_at_index(h, min_non_zero_index));
     }
 
-    h->total_count = observed_total_count;
+    atomic_store(&h->total_count, observed_total_count);
 }
 
 static int32_t buckets_needed_to_cover_value(int64_t value, int32_t sub_bucket_count, int32_t unit_magnitude)
@@ -327,6 +338,11 @@ int hdr_init(
         int significant_figures,
         struct hdr_histogram** result)
 {
+    if(!hdrMutexInit) {
+        hdr_mutex_init(&hdrMutex);
+        hdrMutexInit = true;
+    }
+
     int64_t* counts;
     struct hdr_histogram_bucket_config cfg;
     struct hdr_histogram* histogram;
@@ -337,17 +353,20 @@ int hdr_init(
         return r;
     }
 
+    hdr_mutex_lock(&hdrMutex);
     counts = calloc((size_t) cfg.counts_len, sizeof(int64_t));
     histogram = calloc(1, sizeof(struct hdr_histogram));
 
     if (!counts || !histogram)
     {
+        hdr_mutex_unlock(&hdrMutex);
         return ENOMEM;
     }
 
     histogram->counts = counts;
 
     hdr_init_preallocated(histogram, &cfg);
+    hdr_mutex_unlock(&hdrMutex);
     *result = histogram;
 
     return 0;
@@ -367,10 +386,12 @@ int hdr_alloc(int64_t highest_trackable_value, int significant_figures, struct h
 /* reset a histogram to zero. */
 void hdr_reset(struct hdr_histogram *h)
 {
+    hdr_mutex_lock(&hdrMutex);
      h->total_count=0;
      h->min_value = INT64_MAX;
      h->max_value = 0;
      memset(h->counts, 0, (sizeof(int64_t) * h->counts_len));
+    hdr_mutex_unlock(&hdrMutex);
 }
 
 size_t hdr_get_memory_size(struct hdr_histogram *h)
